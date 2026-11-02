@@ -1,0 +1,9 @@
+# Fix #15: Prevent accidental commit of Wi-Fi credentials
+secrets.h
+
+# Arduino IDE build artifacts
+build/
+*.elf
+*.bin
+*.hex
+*.map
