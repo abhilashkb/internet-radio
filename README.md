@@ -169,26 +169,64 @@ GND         ──────►  GND
 
 ## Power and grounding
 
-| Supply point | Voltage | Source | Notes |
-|---|:---:|---|---|
-| XIAO ESP32S3 | 5 V | USB-C connector | Powers the MCU and generates the 3.3 V rail via its internal regulator |
-| OLED VCC | 3.3 V | XIAO 3V3 pin | Draw is < 30 mA; well within the XIAO regulator capacity |
-| KY-040 `+` | 3.3 V | XIAO 3V3 pin | Draw is negligible |
-| MAX98357A VIN | 5 V | USB-C VBUS or separate 5 V | See note below |
+### How power flows
 
-**MAX98357A 5 V supply options:**
+Power for the entire radio comes from a single **5 V / 2 A USB-C phone charger**. You plug it directly into the **built-in USB-C connector on the XIAO ESP32S3** — no soldering of USB wires to the PCB is required.
 
-**Option A — From XIAO VBUS (simplest):** Connect MAX98357A VIN to the XIAO's 5V pad (labelled `5V` on the silkscreen, connected to the USB VBUS line). This works for testing and moderate volumes, but the XIAO's USB connector and trace are rated for limited current. Keep speaker volume below 75 % and verify the connector does not run hot.
+The XIAO acts as the central power hub:
 
-**Option B — Shared USB supply (recommended for final build):** Power both the XIAO and the amplifier from the same USB supply, wiring VBUS to both VIN points. This keeps a single ground reference and a single power entry point.
+```
+     5V / 2A PHONE CHARGER
+               |
+            USB-C
+               |
+               v
+        +----------------+
+        | XIAO ESP32S3   |
+        |                |
+        | 5V / VBUS -----+---- MAX98357A VIN
+        |                |
+        | 3V3 -----------+---- OLED VCC
+        |                +---- KY-040 +
+        |                |
+        | GND -----------+---- COMMON GND
+        +----------------+
+```
 
-**Option C — Separate regulated 5 V supply:** If using a bench supply or a dedicated converter, connect its GND to XIAO GND so I2S signals share a reference. **Do not connect two separate 5 V rails together at VIN.**
+### Connection steps
 
-**Rules:**
+1. Plug one end of your USB-C cable into the 5 V / 2 A phone charger.
+2. Plug the other end into the **USB-C connector on the XIAO ESP32S3 board** (the board's own built-in port).
+3. The XIAO receives 5 V through this connector and powers itself.
+4. Wire the XIAO's `5V` / VBUS pin to the MAX98357A VIN for the amplifier's 5 V supply.
+5. Wire the XIAO's `3V3` pin to the OLED VCC and the KY-040 `+` pin.
+6. Connect all module GNDs to the XIAO GND to establish a common ground.
+
+### Rail summary
+
+| Rail | Voltage | Source | Powered components |
+|------|:-------:|--------|-------------------|
+| USB-C VBUS | 5 V | Phone charger | XIAO ESP32S3 (input) |
+| XIAO 5V pin | 5 V | XIAO VBUS passthrough | MAX98357A VIN |
+| XIAO 3V3 pin | 3.3 V | XIAO on-board LDO regulator | SH1106 OLED, KY-040 encoder |
+| GND | 0 V | Common | All modules |
+
+> **Note on XIAO 5V current capacity:** The XIAO's `5V` pin is a direct passthrough from the USB VBUS line. A 2 A charger provides ample headroom for the ESP32-S3 (~250 mA typical) and the MAX98357A at moderate volumes (~300–500 mA). Do not exceed the charger's rated current; do not use cheap cables that have high resistance.
+
+### Permanent installation
+
+You can solder the XIAO onto your permanent PCB using **pin headers**, leaving the board's USB-C connector fully accessible from the outside of the radio enclosure. This gives you:
+- Power input from the phone charger
+- Serial port access for firmware updates via the same connector
+
+> **Important:** Do **not** solder the phone charger's USB-C cable wires directly to the XIAO's GPIO pins or power pads as a substitute for the USB-C connector. Always use the board's built-in USB-C port for power input.
+
+### Safety rules
+
 - Never apply 5 V to the OLED VCC — it is a 3.3 V device.
 - Never apply 5 V to any XIAO GPIO pin — the ESP32-S3 is not 5 V tolerant.
-- Ensure all GNDs (XIAO, OLED, encoder, amplifier) share a single common connection.
-- Disconnect power completely before re-wiring.
+- Ensure all GNDs (XIAO, OLED, encoder, amplifier) share a single common connection point.
+- Disconnect power completely before changing any wiring.
 
 ---
 
