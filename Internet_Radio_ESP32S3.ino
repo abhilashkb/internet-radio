@@ -1,79 +1,33 @@
 /* -------------------------------------------------
-   Internet Radio - generic ESP32-S3 dev board edition
+   Internet Radio - ESP32-S3 (ESP32-audioI2S version)
 
-   Target board : ESP32-S3 development board (e.g. ESP32-S3-DevKitC-1
-                  N8R8 and clones): dual core 240 MHz, 8 MB flash,
-                  8 MB octal PSRAM, Wi-Fi + Bluetooth 5 (LE).
-   Based on     : abhilashkb/internet-radio (Seeed XIAO ESP32S3).
-                  Original project by Tech Talkies YouTube channel.
-                  https://www.youtube.com/@techtalkies1
+   Based on : abhilashkb/internet-radio
 
-   Hardware
-     - Display : 1.3" SH1106 128x64 I2C OLED
-     - Amp     : MAX98357A I2S mono amplifier + 4-8 ohm speaker
-     - Control : KY-040 rotary encoder with push switch
+   WIRING (matches the working AudioTools test sketch)
+     MAX98357A BCLK -> GPIO4
+     MAX98357A LRC  -> GPIO5
+     MAX98357A DIN  -> GPIO6
+     MAX98357A VIN  -> 5V,  GND -> GND
+     MAX98357A SD   -> leave unconnected (or 3V3)
 
-   WIRING (ESP32-S3 dev board, GPIO numbers - not header positions)
-     OLED SDA        -> GPIO8
-     OLED SCL        -> GPIO9
-     OLED VCC / GND  -> 3V3 / GND
-     MAX98357A DIN   -> GPIO4
-     MAX98357A BCLK  -> GPIO5
-     MAX98357A LRC   -> GPIO6
-     MAX98357A VIN   -> 5V pin of the board
-     MAX98357A GND   -> GND
-     MAX98357A SD    -> leave unconnected, or tie to 3V3 if the
-                        breakout has no built-in pull-up
-     KY-040 CLK      -> GPIO15
-     KY-040 DT       -> GPIO16
-     KY-040 SW       -> GPIO17
-     KY-040 +  / GND -> 3V3 / GND   (3.3 V, never 5 V)
+   OPTIONAL (sketch runs fine without them)
+     OLED SH1106 SDA -> GPIO8, SCL -> GPIO9
+     KY-040 CLK -> GPIO15, DT -> GPIO16, SW -> GPIO17
 
-   Pins deliberately avoided on an N8R8 board:
-     GPIO26-32   : in-package flash
-     GPIO33-37   : octal PSRAM / octal flash lines (35, 36, 37 on N8R8)
-     GPIO19, 20  : native USB D- / D+
-     GPIO43, 44  : UART0 TX / RX (serial monitor on the UART port)
-     GPIO0,3,45,46 : boot / strapping pins
-     GPIO48 (or 38 on some boards): on-board RGB LED
-
-   ARDUINO IDE SETTINGS (Tools menu)
-     Board            : ESP32S3 Dev Module
-     PSRAM            : OPI PSRAM        (required - see below)
-     Flash size       : 8MB (64Mb)
-     Flash mode       : QIO 80MHz  (use DIO if the board will not boot)
-     Partition scheme : 8MB with spiffs (3MB APP/1.5MB SPIFFS)
-                        or the default 4MB layout - both fit this sketch
-     USB CDC On Boot  : Disabled to use the UART port for Serial,
-                        Enabled to use the native USB port for Serial
-     Upload speed     : 921600 (lower it if uploads fail)
-     Serial monitor   : 115200 baud
-     If the board is not detected, hold BOOT, tap RST, release BOOT,
-     then upload.
-
-   N16R8 boards (16 MB flash): choose 16MB flash. N8R2 boards have
-   QUAD PSRAM: choose "QSPI PSRAM" and GPIO35-37 become usable.
+   ARDUINO IDE SETTINGS
+     Board  : ESP32S3 Dev Module
+     PSRAM  : OPI PSRAM (N8R8 / N16R8) - recommended
+     Serial : 115200 baud
 
    LIBRARIES
      ESP32-audioI2S (schreibfaul1), ArduinoJson 6.x (NOT 7.x),
-     Adafruit GFX, Adafruit SH110X, ESP32 board package
+     Adafruit GFX, Adafruit SH110X
+     (do NOT include AudioTools in this sketch)
 
-   Changes from the original XIAO ESP32-S3 sketch
-     - Pin map moved from XIAO pads to generic dev-board GPIOs, avoiding
-       the flash/PSRAM, USB, UART and strapping pins listed above
-       (the original used GPIO43/44, which are the UART0 pins here)
-     - PSRAM is checked at boot; the sketch refuses to run the radio
-       without it and says why on the OLED and serial port
-     - Full-size options kept thanks to PSRAM: AAC streams, https
-       streams and a 32 KB JSON buffer
-     - audio.* calls are made only from loop(), never from the fetch
-       task on the other core (the audio library is not thread-safe)
-     - Higher default bitrate cap (128 kbps), Wi-Fi power save off
-     - Free heap / PSRAM printed to serial for diagnostics
-     - Wi-Fi signal strength (4 bars) on the playback screen
-
-   Credentials: edit WIFI_SSID / WIFI_PASSWORD below. Do not commit
-   them to a public repository.
+   Behaviour
+     - If the station list cannot be loaded, BBC World Service
+       is played as a fallback so you always get sound.
+     - If no OLED is found, the radio still plays (serial log only).
 ------------------------------------------------- */
 
 #include <WiFi.h>
@@ -83,13 +37,18 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
 
 // ---------------- Wi-Fi credentials ----------------
-#define WIFI_SSID     "YOUR_WIFI_NAME"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID     "Asianet Abilash"
+#define WIFI_PASSWORD "1234512345"
+
+// ---------------- Fallback stream ------------------
+#define FALLBACK_NAME "BBC World Service"
+#define FALLBACK_URL  "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service"
 
 // ---------------- OLED: SH1106 I2C ----------------
 #define OLED_WIDTH   128
@@ -99,9 +58,9 @@
 #define OLED_SCL     9
 
 // ---------------- I2S audio pins ------------------
-#define I2S_DOUT 4    // MAX98357A DIN
-#define I2S_BCLK 5    // MAX98357A BCLK
-#define I2S_LRCK 6    // MAX98357A LRC / WS
+#define I2S_BCLK 4   // MAX98357A BCLK
+#define I2S_LRCK 5   // MAX98357A LRC / WS
+#define I2S_DOUT 6   // MAX98357A DIN
 
 // ---------------- Rotary encoder ------------------
 #define ENC_CLK 15
@@ -109,43 +68,35 @@
 #define ENC_SW  17
 
 // ---------------- Radio settings ------------------
-#define RB_HOST "http://de1.api.radio-browser.info"
-
-#define STATION_ARRAY_SIZE 40   // stations kept in RAM
-#define RB_FETCH_LIMIT     60   // asked from the API (some get filtered out)
-#define RB_CODEC           "AAC" // "AAC" (as original) or "MP3"
-#define ALLOW_HTTPS        1    // 1 = also accept https:// streams (PSRAM makes TLS affordable)
-#define JSON_DOC_SIZE      32768 // buffer for the filtered JSON result (lives in PSRAM)
-
-#define VOL_MAX        21
-#define INITIAL_VOLUME 18
+#define RB_HOST            "http://de1.api.radio-browser.info"
+#define STATION_ARRAY_SIZE 40
+#define RB_FETCH_LIMIT     60
+#define RB_CODEC           "AAC"   // "AAC" or "MP3"
+#define ALLOW_HTTPS        1
+#define VOL_MAX            21
+#define INITIAL_VOLUME     18
 
 // ---------------- Wi-Fi reconnect -----------------
 #define WIFI_RECONNECT_INTERVAL_MS 15000UL
 
 // ---------------- Layout constants ----------------
-// Normal screen - single-line mode
 #define NS_HEADER_Y   0
 #define NS_DIVIDER1_Y 13
 #define NS_LABEL_Y    17
 #define NS_TITLE_Y    29
 #define NS_META_Y     40
-
-// Normal screen - two-line mode
 #define NS_STNAME_Y   27
 #define NS_STMETA_Y   36
 #define NS_META2_Y    46
 #define NS_DIVIDER2_Y 53
 #define NS_HINT_Y     56
 
-// Browse screen
-#define BS_DIVIDER_Y   12
+#define BS_DIVIDER_Y  12
 #define BS_ROW_Y_START 17
-#define BS_ROW_STEP    13
-#define BS_DIVIDER2_Y  56
-#define BS_HINT_Y      58
+#define BS_ROW_STEP   13
+#define BS_DIVIDER2_Y 56
+#define BS_HINT_Y     58
 
-// Edit screen
 #define ES_DIVIDER_Y  12
 #define ES_CENTER1_Y  20
 #define ES_CENTER2_Y  33
@@ -156,21 +107,18 @@
 #define ES_DIVIDER2_Y 56
 #define ES_HINT_Y     58
 
-// Volume bar
 #define VOL_LABEL_X 88
 #define VOL_BAR_X   88
 #define VOL_BAR_Y   10
 #define VOL_BARS    8
 
-// Wi-Fi signal indicator (playback screen, "NOW PLAYING" row)
-#define WIFI_ICON_X        72     // left edge of the 4 bars
-#define WIFI_ICON_Y        NS_LABEL_Y   // top of the label row; bars sit on its baseline
-#define WIFI_CHECK_MS      2000UL // how often the signal is re-read
-// RSSI (dBm) needed for 4 / 3 / 2 / 1 bars; weaker than the last = 0 bars
-#define WIFI_RSSI_4BARS    -55
-#define WIFI_RSSI_3BARS    -65
-#define WIFI_RSSI_2BARS    -75
-#define WIFI_RSSI_1BAR     -85
+#define WIFI_ICON_X  72
+#define WIFI_ICON_Y  NS_LABEL_Y
+#define WIFI_CHECK_MS 2000UL
+#define WIFI_RSSI_4BARS -55
+#define WIFI_RSSI_3BARS -65
+#define WIFI_RSSI_2BARS -75
+#define WIFI_RSSI_1BAR  -85
 
 #define SHORT_TEXT_MAX  18
 #define ENC_DEBOUNCE_MS 4
@@ -204,10 +152,12 @@ static const int GENRE_COUNT = sizeof(GENRES) / sizeof(GENRES[0]);
 
 Audio audio;
 Adafruit_SH1106G display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+bool hasDisplay = false;
+
 QueueHandle_t encQueue = nullptr;
 
-enum EncEvent  { EV_CW, EV_CCW, EV_PRESS, EV_LONG };
-enum UiMode    { MODE_NORMAL, MODE_BROWSE, MODE_EDIT };
+enum EncEvent { EV_CW, EV_CCW, EV_PRESS, EV_LONG };
+enum UiMode { MODE_NORMAL, MODE_BROWSE, MODE_EDIT };
 enum FocusItem { F_NOWPLAYING, F_COUNTRY, F_TYPE };
 
 struct Station {
@@ -221,7 +171,6 @@ Station stations[STATION_ARRAY_SIZE];
 int stationCount = 0;
 int currentStation = 0;
 int focusIndex = F_NOWPLAYING;
-
 UiMode uiMode = MODE_NORMAL;
 bool uiDirty = true;
 String streamTitle = "Connecting...";
@@ -241,16 +190,16 @@ volatile uint32_t holdStartMs = 0;
 volatile bool buttonHolding = false;
 
 // Async fetch state
-volatile bool fetchInProgress = false;  // true from request until loop() finishes handling
-volatile bool fetchDone = false;        // set by the fetch task when it has finished
-volatile bool fetchOk = false;          // result of the fetch
+volatile bool fetchInProgress = false;
+volatile bool fetchDone = false;
+volatile bool fetchOk = false;
 TaskHandle_t fetchTaskHandle = nullptr;
 static String fetchGenreArg;
 static String fetchCountryArg;
 
 uint32_t lastWifiRetryMs = 0;
 
-// Wi-Fi signal indicator state: -1 = not connected, 0..4 = bars
+// Wi-Fi signal indicator: -1 = not connected, 0..4 = bars
 int wifiLevel = -1;
 float wifiRssiAvg = 0;
 bool wifiRssiValid = false;
@@ -259,6 +208,7 @@ uint32_t lastWifiCheckMs = 0;
 // --------------------------------------------------
 // Helpers
 // --------------------------------------------------
+
 String countryName(String c) {
   c.toUpperCase();
   for (int i = 0; i < COUNTRY_COUNT; i++) {
@@ -301,17 +251,27 @@ void drawCentered(const String& text, int y, uint8_t textSize = 1) {
   display.print(text);
 }
 
+// Puts the fallback stream into slot 0 so there is always something to play.
+void loadFallbackStation() {
+  stations[0].name = FALLBACK_NAME;
+  stations[0].url = FALLBACK_URL;
+  stations[0].bitrate = 128;
+  stations[0].country = "GB";
+  stationCount = 1;
+  currentStation = 0;
+}
+
 // --------------------------------------------------
 // Drawing
 // --------------------------------------------------
+
 void drawVolume() {
   int vol = audio.getVolume();
   display.setTextSize(1);
   display.setCursor(VOL_LABEL_X, NS_HEADER_Y);
   display.print(muted ? "MUTE" : "VOL");
-
   for (int i = 0; i < VOL_BARS; i++) {
-    int h = 2 + (i / 2) + (i % 2);   // bar heights 2,3,3,4,4,5,5,6
+    int h = 2 + (i / 2) + (i % 2);
     int x = VOL_BAR_X + i * 5;
     int y = VOL_BAR_Y + (8 - h);
     if (!muted && i < (vol * VOL_BARS / VOL_MAX)) {
@@ -333,13 +293,10 @@ void drawLoadingScreen() {
   display.display();
 }
 
-// Four signal bars of rising height, sitting on the baseline of the
-// "NOW PLAYING" text. Lit bars are solid; unlit bars are a single dot
-// row. A small cross is drawn when Wi-Fi is not connected.
 void drawWifiIcon() {
-  const int base = WIFI_ICON_Y + 6;             // last pixel row of the 7 px glyphs
+  const int base = WIFI_ICON_Y + 6;
   for (int i = 0; i < 4; i++) {
-    int h = 2 + i * 2;                           // 2, 4, 6, 8 px
+    int h = 2 + i * 2;
     int x = WIFI_ICON_X + i * 4;
     if (i < wifiLevel) {
       display.fillRect(x, base - h + 1, 3, h, SH110X_WHITE);
@@ -347,15 +304,13 @@ void drawWifiIcon() {
       display.drawFastHLine(x, base, 3, SH110X_WHITE);
     }
   }
-  if (wifiLevel < 0) {                           // disconnected: draw an "x"
+  if (wifiLevel < 0) {
     int x0 = WIFI_ICON_X + 18;
     display.drawLine(x0, base - 5, x0 + 5, base, SH110X_WHITE);
     display.drawLine(x0, base, x0 + 5, base - 5, SH110X_WHITE);
   }
 }
 
-// Re-reads the signal every WIFI_CHECK_MS. RSSI is smoothed so the bars
-// do not flicker, and the screen is only redrawn when the bar count changes.
 void updateWifiLevel() {
   uint32_t now = millis();
   if (now - lastWifiCheckMs < WIFI_CHECK_MS) return;
@@ -369,18 +324,19 @@ void updateWifiLevel() {
     int r = WiFi.RSSI();
     wifiRssiAvg = wifiRssiValid ? (wifiRssiAvg * 0.7f + r * 0.3f) : (float)r;
     wifiRssiValid = true;
-    if      (wifiRssiAvg >= WIFI_RSSI_4BARS) newLevel = 4;
+    if (wifiRssiAvg >= WIFI_RSSI_4BARS) newLevel = 4;
     else if (wifiRssiAvg >= WIFI_RSSI_3BARS) newLevel = 3;
     else if (wifiRssiAvg >= WIFI_RSSI_2BARS) newLevel = 2;
-    else if (wifiRssiAvg >= WIFI_RSSI_1BAR)  newLevel = 1;
-    else                                      newLevel = 0;
+    else if (wifiRssiAvg >= WIFI_RSSI_1BAR) newLevel = 1;
+    else newLevel = 0;
   }
 
   if (newLevel != wifiLevel) {
     wifiLevel = newLevel;
     if (uiMode == MODE_NORMAL && !fetchInProgress) uiDirty = true;
-    Serial.printf("Wi-Fi signal: %d bar(s)%s\n", wifiLevel,
-                  wifiRssiValid ? (String(" (") + String((int)wifiRssiAvg) + " dBm)").c_str() : "");
+    Serial.printf("Wi-Fi signal: %d bar(s)", wifiLevel);
+    if (wifiRssiValid) Serial.printf(" (%d dBm)", (int)wifiRssiAvg);
+    Serial.println();
   }
 }
 
@@ -394,6 +350,7 @@ void drawNormalScreen() {
   display.setCursor(0, NS_LABEL_Y);
   display.print("NOW PLAYING");
   drawWifiIcon();
+
   if (stationCount > 0) {
     String idx = String(currentStation + 1) + "/" + String(stationCount);
     display.setCursor(OLED_WIDTH - (int)idx.length() * 6, NS_LABEL_Y);
@@ -428,7 +385,7 @@ void drawNormalScreen() {
 
   display.drawLine(0, NS_DIVIDER2_Y, 127, NS_DIVIDER2_Y, SH110X_WHITE);
   display.setCursor(0, NS_HINT_Y);
-  display.print("Turn:Vol  Press:Mute");
+  display.print("Turn:Vol Press:Mute");
 }
 
 void drawBrowseScreen() {
@@ -449,7 +406,6 @@ void drawBrowseScreen() {
     display.setCursor(3, y);
     display.print(labels[i]);
     display.setCursor(70, y);
-
     if (i == F_NOWPLAYING) {
       if (stationCount > 0) display.print(shortText(stations[currentStation].name, 9));
       else display.print("Empty");
@@ -469,10 +425,9 @@ void drawBrowseScreen() {
 void drawEditScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
-  if (focusIndex == F_NOWPLAYING)      display.print("SELECT STATION");
-  else if (focusIndex == F_COUNTRY)    display.print("SELECT COUNTRY");
-  else                                 display.print("SELECT GENRE");
-
+  if (focusIndex == F_NOWPLAYING) display.print("SELECT STATION");
+  else if (focusIndex == F_COUNTRY) display.print("SELECT COUNTRY");
+  else display.print("SELECT GENRE");
   display.drawLine(0, ES_DIVIDER_Y, 127, ES_DIVIDER_Y, SH110X_WHITE);
 
   if (focusIndex == F_NOWPLAYING) {
@@ -507,17 +462,20 @@ void drawEditScreen() {
 }
 
 void drawUI() {
+  if (!hasDisplay) {          // no OLED attached: nothing to draw
+    uiDirty = false;
+    return;
+  }
   if (fetchInProgress) {
     drawLoadingScreen();
     return;
   }
-
   display.clearDisplay();
   display.setTextColor(SH110X_WHITE);
 
-  if (uiMode == MODE_NORMAL)      drawNormalScreen();
+  if (uiMode == MODE_NORMAL) drawNormalScreen();
   else if (uiMode == MODE_BROWSE) drawBrowseScreen();
-  else                            drawEditScreen();
+  else drawEditScreen();
 
   if (buttonHolding) {
     int progress = min(12, (int)((millis() - holdStartMs) / 60));
@@ -531,24 +489,23 @@ void drawUI() {
 
 // --------------------------------------------------
 // Station fetch (runs on core 0 in a short-lived task)
-// The task ONLY downloads and parses. All audio.* calls are done
-// afterwards from loop(), because the audio library is not
-// thread-safe.
+// The task ONLY downloads and parses. All audio.* calls are made
+// from loop(), because the audio library is not thread-safe.
 // --------------------------------------------------
+
 bool fetchStationsInternal(const String& tag, const String& country) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
-
   String url = String(RB_HOST) +
                "/json/stations/search?limit=" + String(RB_FETCH_LIMIT) +
                "&hidebroken=true&order=clickcount&reverse=true&codec=" RB_CODEC
                "&bitrateMax=" + String(bitrateCap);
-  if (tag != "all")     url += "&tag=" + tag;
+  if (tag != "all") url += "&tag=" + tag;
   if (country != "all") url += "&countrycode=" + country;
 
   http.begin(url);
-  http.useHTTP10(true);        // no chunked encoding, safe to stream-parse
+  http.useHTTP10(true);
   http.setTimeout(12000);
 
   int code = http.GET();
@@ -558,15 +515,14 @@ bool fetchStationsInternal(const String& tag, const String& country) {
     return false;
   }
 
-  // Keep only the 4 fields we use; the rest of each record is discarded
-  // while parsing, so a small heap buffer is enough (no PSRAM needed).
   StaticJsonDocument<192> filter;
   filter[0]["name"] = true;
   filter[0]["url_resolved"] = true;
   filter[0]["bitrate"] = true;
   filter[0]["countrycode"] = true;
 
-  DynamicJsonDocument doc(JSON_DOC_SIZE);
+  // Smaller buffer when there is no PSRAM
+  DynamicJsonDocument doc(psramFound() ? 32768 : 16384);
   DeserializationError error =
     deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
@@ -586,27 +542,28 @@ bool fetchStationsInternal(const String& tag, const String& country) {
 #endif
     if (!okScheme) continue;
 
-    stations[stationCount].name    = s["name"] | "Unknown station";
-    stations[stationCount].url     = u;
+    stations[stationCount].name = s["name"] | "Unknown station";
+    stations[stationCount].url = u;
     stations[stationCount].bitrate = s["bitrate"] | 0;
     stations[stationCount].country = s["countrycode"] | "";
     stationCount++;
     if (stationCount >= STATION_ARRAY_SIZE) break;
   }
 
-  Serial.printf("Stations loaded: %d (heap %u, PSRAM %u free)\n", stationCount, ESP.getFreeHeap(), ESP.getFreePsram());
+  Serial.printf("Stations loaded: %d (heap %u, PSRAM %u free)\n",
+                stationCount, ESP.getFreeHeap(), ESP.getFreePsram());
   return stationCount > 0;
 }
 
 void taskFetch(void* p) {
   fetchOk = fetchStationsInternal(fetchGenreArg, fetchCountryArg);
-  fetchDone = true;            // loop() picks this up and starts playback
+  fetchDone = true;
   fetchTaskHandle = nullptr;
   vTaskDelete(nullptr);
 }
 
 void applyChange() {
-  if (fetchInProgress) return;   // prevent double-fetch
+  if (fetchInProgress) return;
   fetchGenreArg = selectedGenre;
   fetchCountryArg = selectedCountry;
   fetchDone = false;
@@ -617,18 +574,16 @@ void applyChange() {
 
 // Called from loop() once the fetch task has finished.
 void finishFetch() {
+  audio.stopSong();
   if (fetchOk) {
     currentStation = 0;
-    streamTitle = "";
-    audio.stopSong();
-    audio.connecttohost(stations[0].url.c_str());
-    streamTitle = stations[0].name;
   } else {
-    stationCount = 0;
-    currentStation = 0;
-    streamTitle = "No stations found";
-    audio.stopSong();
+    Serial.println("Station list unavailable - playing fallback stream.");
+    loadFallbackStation();
   }
+  streamTitle = "";
+  audio.connecttohost(stations[0].url.c_str());
+  streamTitle = stations[0].name;
   fetchInProgress = false;
   uiDirty = true;
 }
@@ -646,6 +601,7 @@ void playStation(int i) {
 // --------------------------------------------------
 // Encoder events
 // --------------------------------------------------
+
 void handleEvent(uint8_t ev) {
   browseLastAction = millis();
 
@@ -670,13 +626,11 @@ void handleEvent(uint8_t ev) {
       previewTag = selectedGenre;
       previewCountry = selectedCountry;
     }
-
   } else if (uiMode == MODE_BROWSE) {
-    if (ev == EV_CW)         focusIndex = (focusIndex + 1) % 3;
-    else if (ev == EV_CCW)   focusIndex = (focusIndex + 2) % 3;
+    if (ev == EV_CW) focusIndex = (focusIndex + 1) % 3;
+    else if (ev == EV_CCW) focusIndex = (focusIndex + 2) % 3;
     else if (ev == EV_PRESS) uiMode = MODE_EDIT;
-    else if (ev == EV_LONG)  uiMode = MODE_NORMAL;
-
+    else if (ev == EV_LONG) uiMode = MODE_NORMAL;
   } else if (uiMode == MODE_EDIT) {
     if (focusIndex == F_NOWPLAYING) {
       if (ev == EV_CW && stationCount > 0)
@@ -689,7 +643,6 @@ void handleEvent(uint8_t ev) {
       } else if (ev == EV_LONG) {
         uiMode = MODE_BROWSE;
       }
-
     } else if (focusIndex == F_COUNTRY) {
       if (ev == EV_CW || ev == EV_CCW) {
         int ci = 0;
@@ -706,7 +659,6 @@ void handleEvent(uint8_t ev) {
       } else if (ev == EV_LONG) {
         uiMode = MODE_BROWSE;
       }
-
     } else if (focusIndex == F_TYPE) {
       if (ev == EV_CW || ev == EV_CCW) {
         int gi = 0;
@@ -725,7 +677,6 @@ void handleEvent(uint8_t ev) {
       }
     }
   }
-
   uiDirty = true;
 }
 
@@ -773,43 +724,41 @@ void taskRotary(void* p) {
 // --------------------------------------------------
 // Setup / loop
 // --------------------------------------------------
+
 void setup() {
   Serial.begin(115200);
-  delay(500);   // give the USB-CDC / UART monitor a moment to attach
-  Serial.printf("Free heap at boot: %u  PSRAM: %u of %u bytes free\n",
+  delay(500);
+
+  Serial.printf("Free heap at boot: %u PSRAM: %u of %u bytes free\n",
                 ESP.getFreeHeap(), ESP.getFreePsram(), ESP.getPsramSize());
 
-  Wire.begin(OLED_SDA, OLED_SCL);
-  Wire.setClock(400000);
-
-  if (!display.begin(OLED_ADDRESS, true)) {
-    Serial.println("SH1106 OLED initialization failed. Check wiring/address.");
-    while (true) delay(1000);
+  if (!psramFound()) {
+    Serial.println("Warning: PSRAM not found. Set Tools > PSRAM > OPI PSRAM for best results.");
   }
 
-  display.clearDisplay();
-  display.setTextColor(SH110X_WHITE);
-  drawCentered("INTERNET RADIO", 18);
-  drawCentered("Starting...", 34);
-  display.display();
-
-  if (!psramFound()) {
-    Serial.println("PSRAM not found. Set Tools > PSRAM > OPI PSRAM (N8R8/N16R8) or QSPI PSRAM (N8R2), then re-upload.");
+  // OLED is optional: continue without it if it is not found
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  hasDisplay = display.begin(OLED_ADDRESS, true);
+  if (hasDisplay) {
     display.clearDisplay();
-    drawCentered("PSRAM not found", 20);
-    drawCentered("Tools > PSRAM >", 34);
-    drawCentered("OPI PSRAM", 44);
+    display.setTextColor(SH110X_WHITE);
+    drawCentered("INTERNET RADIO", 18);
+    drawCentered("Starting...", 34);
     display.display();
-    while (true) delay(1000);
+  } else {
+    Serial.println("OLED not found - continuing without display.");
   }
 
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);          // steadier streaming
+  WiFi.setSleep(false);   // steadier streaming
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  display.clearDisplay();
-  drawCentered("Connecting Wi-Fi", 25);
-  display.display();
+  if (hasDisplay) {
+    display.clearDisplay();
+    drawCentered("Connecting Wi-Fi", 25);
+    display.display();
+  }
 
   Serial.print("Connecting to Wi-Fi");
   uint32_t wifiStart = millis();
@@ -823,7 +772,7 @@ void setup() {
     Serial.print("Wi-Fi connected: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("Wi-Fi connection timed out. Check WIFI_SSID / WIFI_PASSWORD (2.4 GHz only) and restart.");
+    Serial.println("Wi-Fi connection timed out. Check WIFI_SSID / WIFI_PASSWORD (2.4 GHz only).");
     streamTitle = "Wi-Fi unavailable";
   }
 
@@ -838,9 +787,8 @@ void setup() {
   xTaskCreatePinnedToCore(taskRotary, "rotary", 4096, nullptr, 1, nullptr, 1);
 
   if (WiFi.status() == WL_CONNECTED) {
-    applyChange();   // initial load is also async
+    applyChange();   // initial load is async; falls back to BBC if it fails
   }
-
   uiDirty = true;
 }
 
@@ -855,7 +803,7 @@ void loop() {
 
   uint8_t event;
   while (encQueue != nullptr && xQueueReceive(encQueue, &event, 0) == pdTRUE) {
-    if (!fetchInProgress) handleEvent(event);   // ignore input while loading
+    if (!fetchInProgress) handleEvent(event);
   }
 
   // Browse/edit timeout - reset preview state to committed values
@@ -875,13 +823,11 @@ void loop() {
       lastWifiRetryMs = now;
       Serial.println("Wi-Fi lost. Attempting reconnect...");
       WiFi.reconnect();
-
       uint32_t t = millis();
       while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(200);
-
       if (WiFi.status() == WL_CONNECTED) {
         Serial.println("Wi-Fi reconnected.");
-        applyChange();   // reload stations after reconnect
+        applyChange();
       }
     }
   }
@@ -896,6 +842,7 @@ void loop() {
 // --------------------------------------------------
 // ESP32-audioI2S callbacks
 // --------------------------------------------------
+
 void audio_showstreamtitle(const char* info) {
   if (info != nullptr && strlen(info) > 0) {
     streamTitle = String(info);
@@ -908,8 +855,7 @@ void audio_info(const char* info) {
   Serial.println(info);
 }
 
-// Called for any stream end, not only MP3. No auto-advance by design;
-// pick another station from the Browse menu.
+// Called for any stream end. No auto-advance by design.
 void audio_eof_mp3(const char* info) {
   Serial.print("Audio stream ended: ");
   Serial.println(info);
