@@ -41,6 +41,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include "driver/rtc_io.h"   // RTC pull-up for the wake-up button
+#include "esp_sleep.h"       // deep sleep
 
 // ---------------- Wi-Fi credentials ----------------
 #define WIFI_SSID     "Asianet Abilash"
@@ -142,6 +144,7 @@ static const int COUNTRY_COUNT = sizeof(COUNTRIES) / sizeof(COUNTRIES[0]);
 struct GenreEntry {
   const char* tag;
   const char* label;
+  const char* lang;   // optional 3rd value: language forced for this genre (e.g. "english")
 };
 
 static const GenreEntry GENRES[] = {
@@ -149,7 +152,11 @@ static const GenreEntry GENRES[] = {
   { "music", "Music" }, { "news", "News" },
   { "jazz", "Jazz" }, { "classical", "Classical" }, { "rock", "Rock" },
   { "international", "Intl News" }, { "world news", "World" },
-  { "technology", "Tech" },{ "meditation", "Mindful" }
+  { "technology", "Tech" },
+  // Several tags in one genre: separate them with commas (no spaces needed).
+  { "meditation,relaxation,yoga,zen,mindfulness", "Mindful" },
+  { "motivation,inspirational,self improvement", "Motivate", "english" },
+  { "talk,education,science,history,podcast,audiobook,storytelling,comedy", "Learning", "english" }
 };
 static const int GENRE_COUNT = sizeof(GENRES) / sizeof(GENRES[0]);
 
@@ -175,7 +182,7 @@ QueueHandle_t encQueue = nullptr;
 
 enum EncEvent { EV_CW, EV_CCW, EV_PRESS, EV_LONG };
 enum UiMode { MODE_NORMAL, MODE_BROWSE, MODE_EDIT };
-enum FocusItem { F_NOWPLAYING, F_COUNTRY, F_TYPE, F_LANG };
+enum FocusItem { F_NOWPLAYING, F_COUNTRY, F_TYPE, F_LANG, F_SLEEP };
 
 struct Station {
   String name;
@@ -197,6 +204,7 @@ String previewTag = "all";
 String previewCountry = "all";
 String selectedGenre = "all";
 String selectedCountry = "all";
+bool noResults = false;   // last search found nothing for the chosen language
 bool bbcOnly = false;   // true after boot: only BBC World Service is loaded
 String selectedLanguage = "malayalam";   // default filter, loaded on first press
 String previewLanguage = "malayalam";
@@ -300,6 +308,81 @@ String asciiOnly(const String& in) {
 #define SCROLL_STEP_MS 300UL  // scroll speed (lower = faster)
 bool scrollActive = false;
 uint32_t lastScrollMs = 0;
+
+// Screen timeout: the OLED is blanked after 3 minutes without input
+// (this also protects it from burn-in). Turning the knob or pressing the
+// button wakes it. Audio keeps playing while the screen is off.
+#define SCREEN_TIMEOUT_MS 180000UL   // 3 minutes
+bool screenOff = false;
+uint32_t lastActivityMs = 0;
+
+void wakeScreen() {
+  lastActivityMs = millis();
+  if (screenOff) {
+    screenOff = false;
+    uiDirty = true;
+  }
+}
+
+// ---- Sleep timer ----------------------------------------------------------
+// When the timer ends the radio stops, Wi-Fi and the OLED are switched off and
+// the ESP32-S3 goes into deep sleep. Press the encoder button to wake it up
+// (it restarts and plays BBC World Service again, like a normal boot).
+static const int SLEEP_OPTIONS[] = { 0, 15, 30, 40, 60, 90, 120 };   // minutes, 0 = Off
+static const int SLEEP_OPTION_COUNT = sizeof(SLEEP_OPTIONS) / sizeof(SLEEP_OPTIONS[0]);
+int sleepIdx = 0;            // chosen option
+int previewSleepIdx = 0;     // option highlighted in the editor
+bool sleepActive = false;
+uint32_t sleepEndMs = 0;
+
+String sleepOptionLabel(int idx) {
+  return (SLEEP_OPTIONS[idx] == 0) ? String("Off") : String(SLEEP_OPTIONS[idx]) + " min";
+}
+
+int sleepMinutesLeft() {
+  if (!sleepActive) return 0;
+  int32_t left = (int32_t)(sleepEndMs - millis());
+  if (left < 0) left = 0;
+  return (left + 59999) / 60000;     // round up
+}
+
+void setSleepTimer(int idx) {
+  sleepIdx = idx;
+  if (SLEEP_OPTIONS[idx] == 0) {
+    sleepActive = false;
+    Serial.println("Sleep timer: off");
+  } else {
+    sleepActive = true;
+    sleepEndMs = millis() + (uint32_t)SLEEP_OPTIONS[idx] * 60000UL;
+    Serial.printf("Sleep timer: %d min\n", SLEEP_OPTIONS[idx]);
+  }
+}
+
+void goToSleep() {
+  Serial.println("Sleep timer finished - entering deep sleep. Press the encoder button to wake.");
+  audio.stopSong();
+  delay(200);
+
+  if (hasDisplay) {                  // blank the screen, then send "display off" (0xAE)
+    display.clearDisplay();
+    display.display();
+    Wire.beginTransmission(OLED_ADDRESS);
+    Wire.write((uint8_t)0x00);       // control byte: command
+    Wire.write((uint8_t)0xAE);       // display off
+    Wire.endTransmission();
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Wake-up source: encoder button (GPIO17, pressed = LOW)
+  uint32_t t = millis();
+  while (digitalRead(ENC_SW) == LOW && millis() - t < 3000) delay(10);   // wait for release
+  rtc_gpio_pullup_en((gpio_num_t)ENC_SW);
+  rtc_gpio_pulldown_dis((gpio_num_t)ENC_SW);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)ENC_SW, 0);
+  esp_deep_sleep_start();
+}
 
 bool drawScrollText(const String& text, int y, int maxChars = SCROLL_CHARS) {
   display.setCursor(0, y);
@@ -432,8 +515,8 @@ void drawNormalScreen() {
   }
 
   if (stationCount == 0) {
-    drawCentered("No stations loaded", 31);
-    drawCentered("Check Wi-Fi / API", 43);
+    drawCentered(noResults ? "No stations found" : "No stations loaded", 31);
+    drawCentered(noResults ? "Change the filter" : "Check Wi-Fi / API", 43);
   } else {
     String stName = stations[currentStation].name;
     String stTitle = (streamTitle.length() > 0) ? streamTitle : stName;
@@ -460,18 +543,28 @@ void drawNormalScreen() {
 
   display.drawLine(0, NS_DIVIDER2_Y, 127, NS_DIVIDER2_Y, SH110X_WHITE);
   display.setCursor(0, NS_HINT_Y);
-  display.print("Tap:Next Hold:Menu");
+  if (sleepActive) display.print("Tap:Next Sleep " + String(sleepMinutesLeft()) + "m");
+  else display.print("Tap:Next Hold:Menu");
 }
 
 void drawBrowseScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("BROWSE MENU");
+  String pos = String(focusIndex + 1) + "/5";
+  display.setCursor(OLED_WIDTH - (int)pos.length() * 6, 0);
+  display.print(pos);
   display.drawLine(0, BS_DIVIDER_Y, 127, BS_DIVIDER_Y, SH110X_WHITE);
 
-  const char* labels[] = { "Station", "Country", "Genre", "Language" };
-  for (int i = 0; i < 4; i++) {
-    int y = BS_ROW_Y_START + i * BS_ROW_STEP;
+  const char* labels[] = { "Station", "Country", "Genre", "Language", "Sleep" };
+  const int items = 5;
+  const int rows = 4;                 // visible rows; the menu scrolls
+  int top = focusIndex - (rows - 1);
+  if (top < 0) top = 0;
+
+  for (int r = 0; r < rows && (top + r) < items; r++) {
+    int i = top + r;
+    int y = BS_ROW_Y_START + r * BS_ROW_STEP;
     if (i == focusIndex) {
       display.fillRect(0, y - 1, 128, 10, SH110X_WHITE);
       display.setTextColor(SH110X_BLACK);
@@ -488,8 +581,11 @@ void drawBrowseScreen() {
       display.print(shortText(countryName(selectedCountry), 9));
     } else if (i == F_TYPE) {
       display.print(shortText(typeName(), 9));
-    } else {
+    } else if (i == F_LANG) {
       display.print(shortText(languageLabel(selectedLanguage), 9));
+    } else {
+      if (sleepActive) display.print(String(sleepMinutesLeft()) + "m left");
+      else display.print("Off");
     }
   }
   display.setTextColor(SH110X_WHITE);
@@ -499,74 +595,97 @@ void drawBrowseScreen() {
   display.print("Press:Edit Hold:Exit");
 }
 
+// ---- Generic scrolling list used by the Station / Country / Genre / Language editors ----
+int listCount(int focus) {
+  if (focus == F_NOWPLAYING) return stationCount;
+  if (focus == F_COUNTRY) return COUNTRY_COUNT;
+  if (focus == F_TYPE) return GENRE_COUNT;
+  if (focus == F_SLEEP) return SLEEP_OPTION_COUNT;
+  return LANGUAGE_COUNT;
+}
+
+String listLabel(int focus, int idx) {
+  if (focus == F_NOWPLAYING) return stations[idx].name;
+  if (focus == F_COUNTRY) return String(COUNTRIES[idx].name);
+  if (focus == F_TYPE) return String(GENRES[idx].label);
+  if (focus == F_SLEEP) return sleepOptionLabel(idx);
+  return String(LANGUAGES[idx].label);
+}
+
+int listSelected(int focus) {
+  if (focus == F_NOWPLAYING) return previewStation;
+  if (focus == F_SLEEP) return previewSleepIdx;
+  if (focus == F_COUNTRY) {
+    for (int i = 0; i < COUNTRY_COUNT; i++) if (previewCountry == COUNTRIES[i].code) return i;
+  } else if (focus == F_TYPE) {
+    for (int i = 0; i < GENRE_COUNT; i++) if (previewTag == GENRES[i].tag) return i;
+  } else {
+    for (int i = 0; i < LANGUAGE_COUNT; i++) if (previewLanguage == LANGUAGES[i].tag) return i;
+  }
+  return 0;
+}
+
 void drawEditScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   if (focusIndex == F_NOWPLAYING) display.print("SELECT STATION");
   else if (focusIndex == F_COUNTRY) display.print("SELECT COUNTRY");
   else if (focusIndex == F_TYPE) display.print("SELECT GENRE");
+  else if (focusIndex == F_SLEEP) display.print("SLEEP TIMER");
   else display.print("SELECT LANGUAGE");
   display.drawLine(0, ES_DIVIDER_Y, 127, ES_DIVIDER_Y, SH110X_WHITE);
 
-  if (focusIndex == F_NOWPLAYING) {
-    if (stationCount > 0) {
-      // position counter in the header, e.g. "3/40"
-      String cnt = String(previewStation + 1) + "/" + String(stationCount);
-      display.setCursor(OLED_WIDTH - (int)cnt.length() * 6, 0);
-      display.print(cnt);
-
-      // scrolling list: 4 rows visible, selected station highlighted
-      const int rows = 4;
-      int maxTop = stationCount - rows;
-      if (maxTop < 0) maxTop = 0;
-      int top = previewStation - 1;      // keep one station visible above the selection
-      if (top > maxTop) top = maxTop;
-      if (top < 0) top = 0;
-
-      for (int r = 0; r < rows && (top + r) < stationCount; r++) {
-        int idx = top + r;
-        int y = BS_ROW_Y_START + r * BS_ROW_STEP;
-        if (idx == previewStation) {
-          display.fillRect(0, y - 1, 122, 10, SH110X_WHITE);
-          display.setTextColor(SH110X_BLACK);
-        } else {
-          display.setTextColor(SH110X_WHITE);
-        }
-        display.setCursor(2, y);
-        display.print(shortText(stations[idx].name, 19));
-      }
-      display.setTextColor(SH110X_WHITE);
-
-      // scrollbar on the right edge (only when the list is longer than the screen)
-      if (stationCount > rows) {
-        const int trackY = 14, trackH = 40;
-        display.drawFastVLine(126, trackY, trackH, SH110X_WHITE);
-        int thumbH = (trackH * rows) / stationCount;
-        if (thumbH < 4) thumbH = 4;
-        int thumbY = trackY + ((trackH - thumbH) * previewStation) / (stationCount - 1);
-        display.fillRect(125, thumbY, 3, thumbH, SH110X_WHITE);
-      }
-    } else {
-      drawCentered("No stations available", ES_COUNTRY_Y);
-    }
-  } else if (focusIndex == F_COUNTRY) {
-    drawCentered("< " + countryName(previewCountry) + " >", ES_COUNTRY_Y, 1);
-    drawCentered("Turn to pick country", ES_LABEL_Y);
-  } else if (focusIndex == F_TYPE) {
-    drawCentered("< " + previewGenreName() + " >", ES_COUNTRY_Y, 1);
-    drawCentered("Turn to pick genre", ES_LABEL_Y);
+  int total = listCount(focusIndex);
+  if (total <= 0) {
+    drawCentered("No stations available", ES_COUNTRY_Y);
   } else {
-    drawCentered("< " + languageLabel(previewLanguage) + " >", ES_COUNTRY_Y, 1);
-    drawCentered("Turn to pick language", ES_LABEL_Y);
+    int sel = listSelected(focusIndex);
+
+    // position counter in the header, e.g. "3/40"
+    String cnt = String(sel + 1) + "/" + String(total);
+    display.setCursor(OLED_WIDTH - (int)cnt.length() * 6, 0);
+    display.print(cnt);
+
+    // scrolling list: 4 rows visible, selected item highlighted
+    const int rows = 4;
+    int maxTop = total - rows;
+    if (maxTop < 0) maxTop = 0;
+    int top = sel - 1;                 // keep one item visible above the selection
+    if (top > maxTop) top = maxTop;
+    if (top < 0) top = 0;
+
+    for (int r = 0; r < rows && (top + r) < total; r++) {
+      int idx = top + r;
+      int y = BS_ROW_Y_START + r * BS_ROW_STEP;
+      if (idx == sel) {
+        display.fillRect(0, y - 1, 122, 10, SH110X_WHITE);
+        display.setTextColor(SH110X_BLACK);
+      } else {
+        display.setTextColor(SH110X_WHITE);
+      }
+      display.setCursor(2, y);
+      display.print(shortText(listLabel(focusIndex, idx), 19));
+    }
+    display.setTextColor(SH110X_WHITE);
+
+    // scrollbar on the right edge (only when the list is longer than the screen)
+    if (total > rows) {
+      const int trackY = 14, trackH = 40;
+      display.drawFastVLine(126, trackY, trackH, SH110X_WHITE);
+      int thumbH = (trackH * rows) / total;
+      if (thumbH < 4) thumbH = 4;
+      int thumbY = trackY + ((trackH - thumbH) * sel) / (total - 1);
+      display.fillRect(125, thumbY, 3, thumbH, SH110X_WHITE);
+    }
   }
 
   display.drawLine(0, ES_DIVIDER2_Y, 127, ES_DIVIDER2_Y, SH110X_WHITE);
   display.setCursor(0, ES_HINT_Y);
-  display.print("Turn:Change Press:OK");
+  display.print("Turn:Scroll Press:OK");
 }
 
 void drawUI() {
-  if (!hasDisplay) {          // no OLED attached: nothing to draw
+  if (!hasDisplay || screenOff) {   // no OLED, or screen asleep: nothing to draw
     uiDirty = false;
     return;
   }
@@ -608,7 +727,7 @@ static const char* KERALA_KEYWORDS[] = {
 static const int KERALA_KEYWORD_COUNT = sizeof(KERALA_KEYWORDS) / sizeof(KERALA_KEYWORDS[0]);
 #define KERALA_PER_KEYWORD 6   // max stations taken from each keyword search
 
-bool fetchKeralaFM() {
+bool fetchKeralaFM(const String& language) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   stationCount = 0;
@@ -617,6 +736,7 @@ bool fetchKeralaFM() {
     kw.replace(" ", "%20");
     String url = String(RB_HOST) + "/json/stations/search?limit=" + String(KERALA_PER_KEYWORD) +
                  "&hidebroken=true&order=votes&reverse=true&countrycode=IN&bitrateMax=192&name=" + kw;
+    if (language != "all") url += "&language=" + language;   // strict language filter
 
     HTTPClient http;
     http.begin(url);
@@ -672,8 +792,95 @@ bool fetchKeralaFM() {
   return stationCount > 0;
 }
 
+// Downloads one search URL and appends new (non-duplicate) stations to the list.
+void appendStationsFromUrl(const String& url) {
+  HTTPClient http;
+  http.begin(url);
+  http.useHTTP10(true);
+  http.setTimeout(8000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Search failed: HTTP %d\n", code);
+    http.end();
+    return;
+  }
+
+  StaticJsonDocument<192> filter;
+  filter[0]["name"] = true;
+  filter[0]["url_resolved"] = true;
+  filter[0]["bitrate"] = true;
+  filter[0]["countrycode"] = true;
+
+  DynamicJsonDocument doc(8192);
+  DeserializationError error =
+    deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (error) {
+    Serial.printf("Search JSON error: %s\n", error.c_str());
+    return;
+  }
+
+  for (JsonObject s : doc.as<JsonArray>()) {
+    String u = s["url_resolved"] | "";
+    bool okScheme = u.startsWith("http://");
+#if ALLOW_HTTPS
+    okScheme = okScheme || u.startsWith("https://");
+#endif
+    if (!okScheme) continue;
+
+    bool dup = false;
+    for (int i = 0; i < stationCount; i++) {
+      if (stations[i].url == u) { dup = true; break; }
+    }
+    if (dup) continue;
+
+    String nm = asciiOnly(String(s["name"] | ""));
+    if (nm.length() == 0) nm = "Station " + String(stationCount + 1);
+    stations[stationCount].name = nm;
+    stations[stationCount].url = u;
+    stations[stationCount].bitrate = s["bitrate"] | 0;
+    stations[stationCount].country = s["countrycode"] | "";
+    stationCount++;
+    if (stationCount >= STATION_ARRAY_SIZE) break;
+  }
+}
+
+// Genre with several comma-separated tags, e.g. "meditation,yoga,zen":
+// one search per tag, results merged into one list without duplicates.
+bool fetchMultiTag(const String& tags, const String& country, const String& language) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  stationCount = 0;
+  int n = 1;
+  for (size_t i = 0; i < tags.length(); i++) {
+    if (tags[i] == ',') n++;
+  }
+  int perTag = STATION_ARRAY_SIZE / n;     // share the list between the tags
+  if (perTag < 5) perTag = 5;
+
+  int start = 0;
+  while (stationCount < STATION_ARRAY_SIZE) {
+    int comma = tags.indexOf(',', start);
+    String one = (comma < 0) ? tags.substring(start) : tags.substring(start, comma);
+    one.trim();
+    if (one.length() > 0) {
+      one.replace(" ", "%20");
+      String url = String(RB_HOST) + "/json/stations/search?limit=" + String(perTag) +
+                   "&hidebroken=true&order=votes&reverse=true&bitrateMax=192&tag=" + one;
+      if (language != "all") url += "&language=" + language;   // strict language filter
+      if (country != "all") url += "&countrycode=" + country;
+      appendStationsFromUrl(url);
+      Serial.printf("Tag '%s': %d stations so far\n", one.c_str(), stationCount);
+    }
+    if (comma < 0) break;
+    start = comma + 1;
+  }
+  return stationCount > 0;
+}
+
 bool fetchStationsInternal(const String& tag, const String& country, const String& language) {
-  if (tag == "kerala fm") return fetchKeralaFM();
+  if (tag == "kerala fm") return fetchKeralaFM(language);
+  if (tag.indexOf(',') >= 0) return fetchMultiTag(tag, country, language);
   if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
@@ -744,7 +951,7 @@ bool fetchStationsInternal(const String& tag, const String& country, const Strin
 
   // For international / world news, always offer BBC World Service first,
   // even if the directory has not tagged it with this genre.
-  if (tag == "international" || tag == "world news") {
+  if ((tag == "international" || tag == "world news") && language == "all") {
     bool hasBBC = false;
     for (int i = 0; i < stationCount; i++) {
       if (stations[i].url == FALLBACK_URL) { hasBBC = true; break; }
@@ -786,6 +993,16 @@ void applyChange() {
 
 // Called from loop() once the fetch task has finished.
 void finishFetch() {
+  if (!fetchOk && fetchLanguageArg != "all") {
+    // Strict language filter: never switch to an English fallback stream.
+    // Keep the current stream playing and tell the user nothing matched.
+    Serial.println("No stations match the language filter - keeping current stream.");
+    noResults = (stationCount == 0);
+    fetchInProgress = false;
+    uiDirty = true;
+    return;
+  }
+  noResults = false;
   audio.stopSong();
   if (fetchOk) {
     currentStation = 0;
@@ -838,10 +1055,11 @@ void handleEvent(uint8_t ev) {
       previewTag = selectedGenre;
       previewCountry = selectedCountry;
       previewLanguage = selectedLanguage;
+      previewSleepIdx = sleepIdx;
     }
   } else if (uiMode == MODE_BROWSE) {
-    if (ev == EV_CW) focusIndex = (focusIndex + 1) % 4;
-    else if (ev == EV_CCW) focusIndex = (focusIndex + 3) % 4;
+    if (ev == EV_CW) focusIndex = (focusIndex + 1) % 5;
+    else if (ev == EV_CCW) focusIndex = (focusIndex + 4) % 5;
     else if (ev == EV_PRESS) uiMode = MODE_EDIT;
     else if (ev == EV_LONG) uiMode = MODE_NORMAL;
   } else if (uiMode == MODE_EDIT) {
@@ -883,14 +1101,16 @@ void handleEvent(uint8_t ev) {
         previewTag = GENRES[gi].tag;
       } else if (ev == EV_PRESS) {
         selectedGenre = previewTag;
-        // International / tech streams are mostly English, so drop the
-        // Malayalam language and country filters or nothing would match.
-        if (selectedGenre == "international" || selectedGenre == "world news" ||
-            selectedGenre == "technology" || selectedGenre == "kerala fm") {
-          selectedLanguage = "all";
-          selectedCountry = "all";
-          previewLanguage = "all";
-          previewCountry = "all";
+        // Strict filtering: the chosen Language (and Country) stay active
+        // for every genre. A genre's own language (3rd value in GENRES[])
+        // is used only when no language has been chosen ("All").
+        if (selectedLanguage == "all") {
+          for (int i = 0; i < GENRE_COUNT; i++) {
+            if (selectedGenre == GENRES[i].tag && GENRES[i].lang != nullptr) {
+              selectedLanguage = GENRES[i].lang;
+              previewLanguage = GENRES[i].lang;
+            }
+          }
         }
         applyChange();
         uiMode = MODE_BROWSE;
@@ -909,6 +1129,17 @@ void handleEvent(uint8_t ev) {
       } else if (ev == EV_PRESS) {
         selectedLanguage = previewLanguage;
         applyChange();
+        uiMode = MODE_BROWSE;
+      } else if (ev == EV_LONG) {
+        uiMode = MODE_BROWSE;
+      }
+    } else if (focusIndex == F_SLEEP) {
+      if (ev == EV_CW) {
+        previewSleepIdx = (previewSleepIdx + 1) % SLEEP_OPTION_COUNT;
+      } else if (ev == EV_CCW) {
+        previewSleepIdx = (previewSleepIdx - 1 + SLEEP_OPTION_COUNT) % SLEEP_OPTION_COUNT;
+      } else if (ev == EV_PRESS) {
+        setSleepTimer(previewSleepIdx);
         uiMode = MODE_BROWSE;
       } else if (ev == EV_LONG) {
         uiMode = MODE_BROWSE;
@@ -1024,6 +1255,8 @@ void setup() {
   }
   xTaskCreatePinnedToCore(taskRotary, "rotary", 4096, nullptr, 1, nullptr, 1);
 
+  lastActivityMs = millis();   // start the screen-timeout clock
+
   // Boot: play BBC World Service. The first encoder press loads the
   // default filter (Malayalam stations); later presses go to the next station.
   loadFallbackStation();
@@ -1046,7 +1279,13 @@ void loop() {
 
   uint8_t event;
   while (encQueue != nullptr && xQueueReceive(encQueue, &event, 0) == pdTRUE) {
-    if (!fetchInProgress) handleEvent(event);
+    if (fetchInProgress) continue;              // ignore input while loading
+    bool wasAsleep = screenOff;
+    wakeScreen();
+    // A button press that wakes the screen only wakes it (no accidental
+    // station change). Turning the knob wakes the screen AND changes volume.
+    if (wasAsleep && (event == EV_PRESS || event == EV_LONG)) continue;
+    handleEvent(event);
   }
 
   // Browse/edit timeout - reset preview state to committed values
@@ -1079,8 +1318,22 @@ void loop() {
 
   updateWifiLevel();
 
+  // Sleep timer finished: stop everything and go into deep sleep
+  if (sleepActive && (int32_t)(millis() - sleepEndMs) >= 0) {
+    goToSleep();
+  }
+
+  // Screen timeout: blank the OLED after 3 minutes without input
+  if (hasDisplay && !screenOff && !fetchInProgress &&
+      millis() - lastActivityMs >= SCREEN_TIMEOUT_MS) {
+    screenOff = true;
+    display.clearDisplay();
+    display.display();          // all pixels off
+    Serial.println("Screen off (timeout)");
+  }
+
   // Keep the marquee moving while long text is scrolling
-  if (hasDisplay && scrollActive && uiMode == MODE_NORMAL && !fetchInProgress &&
+  if (hasDisplay && !screenOff && scrollActive && uiMode == MODE_NORMAL && !fetchInProgress &&
       millis() - lastScrollMs >= SCROLL_STEP_MS) {
     lastScrollMs = millis();
     uiDirty = true;
