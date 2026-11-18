@@ -32,6 +32,7 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>   // https download of the AIR station list
 #include <ArduinoJson.h>
 #include <Audio.h>
 #include <Wire.h>
@@ -124,6 +125,11 @@
 
 #define SHORT_TEXT_MAX  18
 #define ENC_DEBOUNCE_MS 4
+// Number of signal changes that make one "click" of the knob. Most KY-040
+// encoders give 4 per click. If you have to turn the knob two clicks to move
+// one item, change this to 2. If one click skips two items, keep it at 4 or
+// try 8.
+#define ENC_STEPS_PER_DETENT 4
 
 struct CountryEntry {
   const char* code;
@@ -148,7 +154,7 @@ struct GenreEntry {
 };
 
 static const GenreEntry GENRES[] = {
-  { "all", "All" }, { "kerala fm", "Kerala FM" },
+  { "all", "All" }, { "air malayalam", "AIR Malayalam" },
   { "music", "Music" }, { "news", "News" },
   { "jazz", "Jazz" }, { "classical", "Classical" }, { "rock", "Rock" },
   { "international", "Intl News" }, { "world news", "World" },
@@ -716,79 +722,140 @@ void drawUI() {
 // from loop(), because the audio library is not thread-safe.
 // --------------------------------------------------
 
-// Kerala FM: runs several station-name searches (Rainbow, Mango, Club FM,
-// Akashvani / AIR, city names ...) and merges the results into one list
-// without duplicates. Edit the keyword list to add or remove searches.
-static const char* KERALA_KEYWORDS[] = {
-  "mango", "rainbow", "club fm", "akashvani", "all india radio",
-  "kochi", "kozhikode", "thrissur", "trivandrum", "kannur",
-  "red fm", "big fm", "kerala", "malayalam"
-};
-static const int KERALA_KEYWORD_COUNT = sizeof(KERALA_KEYWORDS) / sizeof(KERALA_KEYWORDS[0]);
-#define KERALA_PER_KEYWORD 6   // max stations taken from each keyword search
+// AIR Malayalam: the station list is downloaded from a JSON file on GitHub
+// (codito/akashvani) and only stations whose "language" field contains
+// "Malayalam" are kept. The streams are HLS (.m3u8) and the audio library
+// plays them directly.
+#define AIR_JSON_URL "https://raw.githubusercontent.com/codito/akashvani/master/stations.json"
 
-bool fetchKeralaFM(const String& language) {
+// The Waves streams (radio.wavespb.com) in the JSON file also carry a small
+// video track, and the ESP32 audio library cannot play those. Audio-only AIR
+// streams listed here are added at the TOP of the AIR Malayalam list so
+// there is always something that plays. Add more lines as you find them.
+struct ExtraStation { const char* name; const char* url; int bitrate; };
+static const ExtraStation AIR_EXTRA[] = {
+  { "AIR Malayalam", "https://air.pc.cdn.bitgravity.com/air/live/pbaudio230/playlist.m3u8", 95 },
+};
+static const int AIR_EXTRA_COUNT = sizeof(AIR_EXTRA) / sizeof(AIR_EXTRA[0]);
+
+// 1 = hide the radio.wavespb.com streams from the list (they stay silent),
+// 0 = show every Malayalam station found in the JSON file.
+#define AIR_SKIP_VIDEO_STREAMS 0
+
+bool fetchAirMalayalam() {
   if (WiFi.status() != WL_CONNECTED) return false;
 
+  // Audio-only streams first, so they are available even if the download fails
   stationCount = 0;
-  for (int k = 0; k < KERALA_KEYWORD_COUNT && stationCount < STATION_ARRAY_SIZE; k++) {
-    String kw = KERALA_KEYWORDS[k];
-    kw.replace(" ", "%20");
-    String url = String(RB_HOST) + "/json/stations/search?limit=" + String(KERALA_PER_KEYWORD) +
-                 "&hidebroken=true&order=votes&reverse=true&countrycode=IN&bitrateMax=192&name=" + kw;
-    if (language != "all") url += "&language=" + language;   // strict language filter
+  for (int i = 0; i < AIR_EXTRA_COUNT && stationCount < STATION_ARRAY_SIZE; i++) {
+    stations[stationCount].name = AIR_EXTRA[i].name;
+    stations[stationCount].url = AIR_EXTRA[i].url;
+    stations[stationCount].bitrate = AIR_EXTRA[i].bitrate;
+    stations[stationCount].country = "IN";
+    stationCount++;
+  }
 
-    HTTPClient http;
-    http.begin(url);
-    http.useHTTP10(true);
-    http.setTimeout(8000);
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      Serial.printf("Kerala FM '%s': HTTP %d\n", KERALA_KEYWORDS[k], code);
-      http.end();
-      continue;
-    }
+  WiFiClientSecure client;
+  client.setInsecure();              // skip certificate check (saves memory; public radio list)
+  client.setTimeout(10);             // seconds
 
-    StaticJsonDocument<192> filter;
-    filter[0]["name"] = true;
-    filter[0]["url_resolved"] = true;
-    filter[0]["bitrate"] = true;
-    filter[0]["countrycode"] = true;
+  HTTPClient http;
+  if (!http.begin(client, AIR_JSON_URL)) {
+    Serial.println("AIR list: http.begin failed");
+    return stationCount > 0;
+  }
+  http.useHTTP10(true);              // plain (non-chunked) response
+  http.setTimeout(15000);
 
-    DynamicJsonDocument doc(8192);
-    DeserializationError error =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("AIR list: HTTP %d\n", code);
     http.end();
-    if (error) {
-      Serial.printf("Kerala FM '%s': JSON error %s\n", KERALA_KEYWORDS[k], error.c_str());
+    return stationCount > 0;
+  }
+
+  // The file is large (~270 stations), so it is read in small blocks and
+  // one station object ({ ... }) is handled at a time. Reading in blocks
+  // is much more reliable than byte-by-byte reads over a TLS connection.
+  WiFiClient& stream = http.getStream();
+  StaticJsonDocument<128> filter;
+  filter["name"] = true;
+  filter["stream_url"] = true;
+  filter["language"] = true;
+
+  int scanned = 0;
+  static uint8_t chunk[512];
+  String obj;
+  obj.reserve(1024);
+  bool inObj = false;
+  uint32_t lastData = millis();
+  const char* stopReason = "end of file";
+
+  while (http.connected() || stream.available()) {
+    int avail = stream.available();
+    if (avail <= 0) {
+      if (millis() - lastData > 10000) { stopReason = "read timeout"; break; }
+      delay(5);
       continue;
     }
+    int n = stream.readBytes(chunk, (avail < (int)sizeof(chunk)) ? avail : (int)sizeof(chunk));
+    if (n <= 0) continue;
+    lastData = millis();
 
-    for (JsonObject s : doc.as<JsonArray>()) {
-      String u = s["url_resolved"] | "";
+    for (int i = 0; i < n; i++) {
+      char c = (char)chunk[i];
+      if (!inObj) {
+        if (c == '{') { inObj = true; obj = "{"; }
+        continue;
+      }
+      if (obj.length() < 1500) obj += c;
+      if (c != '}') continue;
+
+      // One complete station object is now in "obj"
+      inObj = false;
+      scanned++;
+
+      StaticJsonDocument<768> doc;
+      DeserializationError err =
+        deserializeJson(doc, obj, DeserializationOption::Filter(filter));
+      if (err) continue;                      // skip a damaged entry
+
+      String lang = doc["language"] | "";
+      lang.toLowerCase();
+      if (lang.indexOf("malayalam") < 0) continue;   // keep Malayalam stations only
+
+      String u = doc["stream_url"] | "";
       bool okScheme = u.startsWith("http://");
 #if ALLOW_HTTPS
       okScheme = okScheme || u.startsWith("https://");
 #endif
       if (!okScheme) continue;
+#if AIR_SKIP_VIDEO_STREAMS
+      if (u.indexOf("radio.wavespb.com") >= 0) continue;   // streams with a video track
+#endif
 
-      bool dup = false;                      // skip streams already in the list
-      for (int i = 0; i < stationCount; i++) {
-        if (stations[i].url == u) { dup = true; break; }
+      bool dup = false;
+      for (int k = 0; k < stationCount; k++) {
+        if (stations[k].url == u) { dup = true; break; }
       }
       if (dup) continue;
 
-      String nm = asciiOnly(String(s["name"] | ""));
-      if (nm.length() == 0) nm = "Station " + String(stationCount + 1);
+      String nm = asciiOnly(String(doc["name"] | ""));
+      if (nm.length() == 0) nm = "AIR " + String(stationCount + 1);
       stations[stationCount].name = nm;
       stations[stationCount].url = u;
-      stations[stationCount].bitrate = s["bitrate"] | 0;
-      stations[stationCount].country = s["countrycode"] | "";
+      stations[stationCount].bitrate = 0;        // not given in the file
+      stations[stationCount].country = "IN";
       stationCount++;
+      Serial.printf("AIR +%d: %s\n", stationCount, nm.c_str());
       if (stationCount >= STATION_ARRAY_SIZE) break;
     }
-    Serial.printf("Kerala FM '%s': %d stations so far\n", KERALA_KEYWORDS[k], stationCount);
+    if (stationCount >= STATION_ARRAY_SIZE) { stopReason = "list full"; break; }
   }
+  http.end();
+
+  Serial.printf("AIR Malayalam: %d of %d stations scanned, stopped: %s (heap %u)\n",
+                stationCount, scanned, stopReason, ESP.getFreeHeap());
   return stationCount > 0;
 }
 
@@ -879,7 +946,7 @@ bool fetchMultiTag(const String& tags, const String& country, const String& lang
 }
 
 bool fetchStationsInternal(const String& tag, const String& country, const String& language) {
-  if (tag == "kerala fm") return fetchKeralaFM(language);
+  if (tag == "air malayalam") return fetchAirMalayalam();   // ignores the Language / Country filters
   if (tag.indexOf(',') >= 0) return fetchMultiTag(tag, country, language);
   if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -988,10 +1055,400 @@ void applyChange() {
   fetchDone = false;
   fetchInProgress = true;
   uiDirty = true;
-  xTaskCreatePinnedToCore(taskFetch, "fetch", 10240, nullptr, 1, &fetchTaskHandle, 0);
+  // The https download of the AIR list needs a bigger stack for TLS;
+  // every other genre keeps the original size.
+  uint32_t fetchStack = (fetchGenreArg == "air malayalam") ? 20480 : 10240;
+  xTaskCreatePinnedToCore(taskFetch, "fetch", fetchStack, nullptr, 1, &fetchTaskHandle, 0);
 }
 
 // Called from loop() once the fetch task has finished.
+// ---- MPEG-TS audio extractor ------------------------------------------------
+// Takes an MPEG-TS byte stream (audio + video) and hands on only the raw AAC
+// (ADTS) audio data. Video packets are thrown away.
+class TsAudioExtractor {
+ public:
+  void reset() { fill_ = 0; pmtPid_ = -1; audioPid_ = -1; audioStarted_ = false; }
+  // Call at the start of every new segment: keep the PIDs, wait for a clean audio start
+  void newSegment() { fill_ = 0; audioStarted_ = false; }
+
+  template <typename Sink>
+  void feed(const uint8_t* data, size_t len, Sink& sink) {
+    size_t i = 0;
+    while (i < len) {
+      if (fill_ == 0) {
+        if (data[i] != 0x47) { i++; continue; }            // wait for the sync byte
+        if (len - i >= 188) { packet(data + i, sink); i += 188; continue; }
+      }
+      pkt_[fill_++] = data[i++];
+      if (fill_ == 188) { packet(pkt_, sink); fill_ = 0; }
+    }
+  }
+
+ private:
+  uint8_t pkt_[188];
+  size_t fill_ = 0;
+  int pmtPid_ = -1;
+  int audioPid_ = -1;
+  bool audioStarted_ = false;
+
+  template <typename Sink>
+  void packet(const uint8_t* p, Sink& sink) {
+    if (p[0] != 0x47) return;
+    const uint8_t* pktEnd = p + 188;
+    bool pusi = (p[1] & 0x40) != 0;
+    int pid = ((p[1] & 0x1F) << 8) | p[2];
+    int afc = (p[3] >> 4) & 0x3;
+    int off = 4;
+    if (afc & 0x2) off += 1 + p[4];
+    if (!(afc & 0x1) || off >= 188) return;                // no payload
+    const uint8_t* pl = p + off;
+    int plen = 188 - off;
+
+    if (pid == 0) {                                        // PAT: find the PMT PID
+      if (!pusi) return;
+      const uint8_t* t = pl + 1 + pl[0];                   // skip the pointer field
+      if (t + 8 > pktEnd) return;
+      int sectionLen = ((t[1] & 0x0F) << 8) | t[2];
+      const uint8_t* e = t + 8;
+      const uint8_t* end = t + 3 + sectionLen - 4;
+      if (end > pktEnd) end = pktEnd;
+      while (e + 4 <= end) {
+        int program = (e[0] << 8) | e[1];
+        if (program != 0) { pmtPid_ = ((e[2] & 0x1F) << 8) | e[3]; break; }
+        e += 4;
+      }
+    } else if (pid == pmtPid_) {                           // PMT: find the AAC audio PID
+      if (!pusi) return;
+      const uint8_t* t = pl + 1 + pl[0];
+      if (t + 12 > pktEnd) return;
+      int sectionLen = ((t[1] & 0x0F) << 8) | t[2];
+      int progInfoLen = ((t[10] & 0x0F) << 8) | t[11];
+      const uint8_t* s = t + 12 + progInfoLen;
+      const uint8_t* end = t + 3 + sectionLen - 4;
+      if (end > pktEnd) end = pktEnd;
+      while (s + 5 <= end) {
+        int type = s[0];
+        int espid = ((s[1] & 0x1F) << 8) | s[2];
+        int infoLen = ((s[3] & 0x0F) << 8) | s[4];
+        if (type == 0x0F && audioPid_ < 0) audioPid_ = espid;   // 0x0F = AAC (ADTS)
+        s += 5 + infoLen;
+      }
+    } else if (pid == audioPid_) {                         // audio: strip the PES header
+      if (pusi) {
+        if (plen < 9 || pl[0] != 0 || pl[1] != 0 || pl[2] != 1) return;
+        int hdr = 9 + pl[8];
+        audioStarted_ = true;
+        if (hdr < plen) sink(pl + hdr, (size_t)(plen - hdr));
+      } else if (audioStarted_) {
+        sink(pl, (size_t)plen);
+      }
+    }
+  }
+};
+
+// ---- HLS relay for streams that carry a hidden video track ------------------
+// The Waves (radio.wavespb.com) AIR streams are HLS with an extra video track,
+// which the audio library cannot play. For those stations the sketch downloads
+// the HLS segments itself, throws the video away (TsAudioExtractor above) and
+// serves the plain AAC audio on a small local server (127.0.0.1). The audio
+// library then plays that local stream like any normal radio stream.
+// All other stations are played directly, exactly as before.
+#define RELAY_PORT 8081
+WiFiServer relayServer(RELAY_PORT);
+bool relayServerStarted = false;
+volatile uint32_t relayGen = 0;      // changes whenever the relay must restart or stop
+volatile bool relayActive = false;
+String relayUrl;
+TaskHandle_t relayTaskHandle = nullptr;
+
+bool needsRelay(const String& url) {
+  return url.indexOf("radio.wavespb.com") >= 0;
+}
+
+// Turns a (possibly relative) playlist entry into a full URL
+String resolveUrl(const String& base, const String& ref) {
+  if (ref.startsWith("http://") || ref.startsWith("https://")) return ref;
+  int schemeEnd = base.indexOf("://");
+  int hostEnd = base.indexOf('/', schemeEnd + 3);
+  if (hostEnd < 0) hostEnd = base.length();
+  if (ref.startsWith("/")) return base.substring(0, hostEnd) + ref;
+  String b = base;
+  int q = b.indexOf('?');
+  if (q >= 0) b = b.substring(0, q);
+  int lastSlash = b.lastIndexOf('/');
+  if (lastSlash < hostEnd) return b + "/" + ref;
+  return b.substring(0, lastSlash + 1) + ref;
+}
+
+// Downloads a small text file (the playlist).
+// The Waves links answer with a redirect (radio.wavespb.com -> a cloudfront
+// address), so redirects are followed here and the final address is returned
+// in finalUrl. That final address is also the base for the relative segment
+// links inside the playlist.
+bool relayHttpGet(const String& url, String& body, String* finalUrl = nullptr) {
+  String cur = url;
+  for (int hop = 0; hop < 5; hop++) {
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setTimeout(10);
+    WiFiClient pc;
+    HTTPClient http;
+    bool began = cur.startsWith("https") ? http.begin(sc, cur) : http.begin(pc, cur);
+    if (!began) return false;
+    http.useHTTP10(true);
+    http.setTimeout(10000);
+    const char* keys[] = { "Location" };
+    http.collectHeaders(keys, 1);
+    int code = http.GET();
+
+    if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+      String loc = http.header("Location");
+      http.end();
+      if (loc.length() == 0) {
+        Serial.printf("Relay: redirect %d without a Location header\n", code);
+        return false;
+      }
+      cur = resolveUrl(cur, loc);
+      Serial.printf("Relay: redirect -> %s\n", cur.c_str());
+      continue;
+    }
+
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("Relay: playlist HTTP %d\n", code);
+      http.end();
+      return false;
+    }
+    body = http.getString();
+    http.end();
+    if (finalUrl) *finalUrl = cur;
+    return true;
+  }
+  Serial.println("Relay: too many redirects");
+  return false;
+}
+
+void relaySession(const String& playlistUrl, uint32_t gen) {
+  // 1. Wait for the audio library to connect to the local server
+  WiFiClient client;
+  uint32_t t0 = millis();
+  while (!client.connected()) {
+    if (gen != relayGen) return;
+    if (millis() - t0 > 10000) { Serial.println("Relay: audio library did not connect"); return; }
+    client = relayServer.available();
+    delay(20);
+  }
+
+  // 2. Read (and ignore) its HTTP request, then answer with an AAC stream header
+  uint32_t last4 = 0;
+  uint32_t t1 = millis();
+  while (client.connected() && millis() - t1 < 3000) {
+    if (client.available()) {
+      last4 = (last4 << 8) | (uint8_t)client.read();
+      if (last4 == 0x0D0A0D0A) break;
+    } else {
+      delay(5);
+    }
+  }
+  client.print("HTTP/1.1 200 OK\r\nContent-Type: audio/aac\r\nConnection: close\r\nicy-name: AIR Malayalam\r\n\r\n");
+
+  TsAudioExtractor ex;
+  ex.reset();
+  bool aborted = false;
+  uint32_t lastWriteOk = millis();
+
+  // Sends audio to the audio library
+  auto sink = [&](const uint8_t* d, size_t n) {
+    size_t off = 0;
+    while (off < n && !aborted) {
+      if (gen != relayGen || !client.connected()) { aborted = true; return; }
+      size_t chunkLen = (n - off > 1024) ? 1024 : (n - off);
+      size_t w = client.write(d + off, chunkLen);
+      if (w == 0) {
+        if (millis() - lastWriteOk > 15000) { aborted = true; return; }
+        delay(5);
+      } else {
+        off += w;
+        lastWriteOk = millis();
+      }
+    }
+  };
+
+  // Downloads one .ts segment and passes only its audio on
+  auto downloadSegment = [&](const String& url) -> bool {
+    WiFiClientSecure sc;
+    sc.setInsecure();
+    sc.setTimeout(10);
+    WiFiClient pc;
+    HTTPClient http;
+    bool began = url.startsWith("https") ? http.begin(sc, url) : http.begin(pc, url);
+    if (!began) return false;
+    http.useHTTP10(true);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("Relay: segment HTTP %d\n", code);
+      http.end();
+      return false;
+    }
+    WiFiClient& s = http.getStream();
+    int remaining = http.getSize();            // -1 when the size is unknown
+    static uint8_t buf[1024];
+    ex.newSegment();
+    uint32_t lastData = millis();
+    while (!aborted && (http.connected() || s.available())) {
+      int avail = s.available();
+      if (avail <= 0) {
+        if (remaining == 0) break;
+        if (millis() - lastData > 10000) break;
+        delay(5);
+        continue;
+      }
+      int n = s.readBytes(buf, (avail < (int)sizeof(buf)) ? avail : (int)sizeof(buf));
+      if (n <= 0) continue;
+      lastData = millis();
+      ex.feed(buf, (size_t)n, sink);
+      if (remaining > 0) {
+        remaining -= n;
+        if (remaining <= 0) break;
+      }
+      if (gen != relayGen) aborted = true;
+    }
+    http.end();
+    return !aborted;
+  };
+
+  // 3. Follow the playlist and keep feeding new segments
+  String mediaUrl = playlistUrl;
+  long lastSeq = -1;
+  int failures = 0;
+  Serial.println("Relay: started");
+
+  while (!aborted && gen == relayGen && client.connected()) {
+    String body;
+    String finalUrl;
+    if (!relayHttpGet(mediaUrl, body, &finalUrl)) {
+      if (++failures > 5) { Serial.println("Relay: playlist download failed"); break; }
+      delay(1000);
+      continue;
+    }
+    failures = 0;
+    mediaUrl = finalUrl;     // keep using the address after the redirect
+
+    // Master playlist: follow its first variant
+    int sti = body.indexOf("#EXT-X-STREAM-INF");
+    if (sti >= 0) {
+      String uri = "";
+      int pos = body.indexOf('\n', sti);
+      while (pos >= 0 && pos + 1 < (int)body.length()) {
+        int e = body.indexOf('\n', pos + 1);
+        String l = body.substring(pos + 1, (e < 0) ? (int)body.length() : e);
+        l.trim();
+        if (l.length() > 0 && !l.startsWith("#")) { uri = l; break; }
+        pos = e;
+      }
+      if (uri.length() == 0) { Serial.println("Relay: empty master playlist"); break; }
+      mediaUrl = resolveUrl(mediaUrl, uri);
+      continue;
+    }
+
+    if (body.indexOf("#EXT-X-KEY") >= 0 && body.indexOf("METHOD=NONE") < 0) {
+      Serial.println("Relay: encrypted stream is not supported");
+      break;
+    }
+
+    // Media playlist: read sequence number, segment length and segment list
+    long mediaSeq = 0;
+    int targetDur = 6;
+    String segs[24];
+    int segCount = 0;
+    int pos = 0;
+    while (pos < (int)body.length()) {
+      int e = body.indexOf('\n', pos);
+      if (e < 0) e = body.length();
+      String l = body.substring(pos, e);
+      l.trim();
+      pos = e + 1;
+      if (l.length() == 0) continue;
+      if (l.startsWith("#EXT-X-MEDIA-SEQUENCE:")) mediaSeq = l.substring(22).toInt();
+      else if (l.startsWith("#EXT-X-TARGETDURATION:")) targetDur = l.substring(22).toInt();
+      else if (!l.startsWith("#")) {
+        if (segCount >= 24) {                    // keep the newest 24
+          for (int k = 0; k < 23; k++) segs[k] = segs[k + 1];
+          segs[23] = l;
+          mediaSeq++;
+        } else {
+          segs[segCount++] = l;
+        }
+      }
+    }
+    if (segCount == 0) { delay(1000); continue; }
+
+    if (lastSeq < 0) {                           // first time: start 2 segments before the live edge
+      int startIdx = (segCount > 2) ? segCount - 2 : 0;
+      lastSeq = mediaSeq + startIdx - 1;
+    }
+
+    int processed = 0;
+    for (int i = 0; i < segCount && !aborted && gen == relayGen; i++) {
+      long seq = mediaSeq + i;
+      if (seq <= lastSeq) continue;
+      lastSeq = seq;                             // never retry a bad segment
+      if (downloadSegment(resolveUrl(mediaUrl, segs[i]))) processed++;
+    }
+    if (aborted) break;
+
+    if (processed == 0) {                        // nothing new yet: wait before asking again
+      int waitMs = targetDur * 500;
+      if (waitMs < 1500) waitMs = 1500;
+      if (waitMs > 4000) waitMs = 4000;
+      uint32_t w = millis();
+      while (millis() - w < (uint32_t)waitMs && gen == relayGen && client.connected()) delay(50);
+    }
+  }
+
+  client.stop();
+  Serial.println("Relay: stopped");
+}
+
+void relayTask(void* p) {
+  for (;;) {
+    if (!relayActive) { delay(100); continue; }
+    uint32_t gen = relayGen;
+    String url = relayUrl;
+    relaySession(url, gen);
+    if (gen == relayGen) relayActive = false;    // ended by itself: wait for the next request
+  }
+}
+
+void relayStart(const String& url) {
+  if (!relayServerStarted) {
+    relayServer.begin();
+    relayServerStarted = true;
+  }
+  relayUrl = url;
+  relayGen++;
+  relayActive = true;
+  if (relayTaskHandle == nullptr) {
+    xTaskCreatePinnedToCore(relayTask, "relay", 16384, nullptr, 1, &relayTaskHandle, 0);
+  }
+}
+
+void relayStop() {
+  relayActive = false;
+  relayGen++;
+}
+
+// Starts a station: Waves streams go through the relay, everything else is played directly
+void startStream(const String& url) {
+  if (needsRelay(url)) {
+    relayStart(url);
+    audio.connecttohost("http://127.0.0.1:8081/live.aac");
+  } else {
+    relayStop();
+    audio.connecttohost(url.c_str());
+  }
+}
+
 void finishFetch() {
   if (!fetchOk && fetchLanguageArg != "all") {
     // Strict language filter: never switch to an English fallback stream.
@@ -1011,7 +1468,7 @@ void finishFetch() {
     loadFallbackStation();
   }
   streamTitle = "";
-  audio.connecttohost(stations[0].url.c_str());
+  startStream(stations[0].url);
   streamTitle = stations[0].name;
   fetchInProgress = false;
   uiDirty = true;
@@ -1022,7 +1479,7 @@ void playStation(int i) {
   currentStation = i;
   streamTitle = "";
   audio.stopSong();
-  audio.connecttohost(stations[i].url.c_str());
+  startStream(stations[i].url);
   streamTitle = stations[i].name;
   uiDirty = true;
 }
@@ -1149,29 +1606,43 @@ void handleEvent(uint8_t ev) {
   uiDirty = true;
 }
 
-// Encoder polling task with debounce guard on CLK edges
+// Encoder polling task.
+// The knob is decoded with a quadrature state table: both pins (CLK and DT)
+// are followed, every valid step adds +1 (clockwise) or -1 (counter-clockwise),
+// and invalid steps caused by contact bounce add 0. This gives reliable
+// two-way scrolling.
+static const int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
 void taskRotary(void* p) {
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
   pinMode(ENC_SW, INPUT_PULLUP);
 
-  int lastClk = digitalRead(ENC_CLK);
+  uint8_t prevState = (digitalRead(ENC_CLK) << 1) | digitalRead(ENC_DT);
+  int8_t steps = 0;
   bool lastBtn = HIGH;
   uint32_t pressAt = 0;
-  uint32_t lastEncMs = 0;
 
   for (;;) {
-    int clk = digitalRead(ENC_CLK);
-    uint32_t now = millis();
-
-    if (clk != lastClk && clk == LOW) {
-      if (now - lastEncMs >= ENC_DEBOUNCE_MS) {
-        uint8_t event = digitalRead(ENC_DT) ? EV_CW : EV_CCW;
+    uint8_t state = (digitalRead(ENC_CLK) << 1) | digitalRead(ENC_DT);
+    if (state != prevState) {
+      steps += ENC_TABLE[(prevState << 2) | state];
+      prevState = state;
+      if (steps >= ENC_STEPS_PER_DETENT) {
+        uint8_t event = EV_CW;
         xQueueSend(encQueue, &event, 0);
-        lastEncMs = now;
+        steps = 0;
+      } else if (steps <= -ENC_STEPS_PER_DETENT) {
+        uint8_t event = EV_CCW;
+        xQueueSend(encQueue, &event, 0);
+        steps = 0;
       }
     }
-    lastClk = clk;
 
     bool btn = digitalRead(ENC_SW);
     if (btn == LOW && lastBtn == HIGH) {
@@ -1186,7 +1657,7 @@ void taskRotary(void* p) {
     }
     lastBtn = btn;
 
-    vTaskDelay(pdMS_TO_TICKS(2));
+    vTaskDelay(1);   // poll about once per millisecond
   }
 }
 
